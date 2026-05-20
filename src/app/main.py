@@ -14,7 +14,11 @@ Architecture:
 from fastapi import FastAPI
 from pydantic import BaseModel
 import gradio as gr
+import sys
+import os
 from src.serving.inference import predict  # Core ML inference logic
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))  # Ensure src is in path for imports
 
 # Initialize FastAPI application
 app = FastAPI(
@@ -22,6 +26,8 @@ app = FastAPI(
     description="ML API for predicting customer churn in telecom industry",
     version="1.0.0"
 )
+
+
 
 # === HEALTH CHECK ENDPOINT ===
 # CRITICAL: Required for AWS Application Load Balancer health checks
@@ -139,6 +145,8 @@ def gradio_interface(
     result = predict(data)
     return str(result)  # Return as string for Gradio display
 
+    
+
 # === GRADIO UI CONFIGURATION ===
 # Build comprehensive Gradio interface with all customer features
 demo = gr.Interface(
@@ -196,7 +204,8 @@ demo = gr.Interface(
          "Yes", "No", "No", "Two year", "No", "Credit card (automatic)",
          60, 45.0, 2700.0]
     ],
-    theme=gr.themes.Soft()  # Professional appearance
+   
+    theme=gr.themes.Glass()  # Professional appearance
 )
 
 # === MOUNT GRADIO UI INTO FASTAPI ===

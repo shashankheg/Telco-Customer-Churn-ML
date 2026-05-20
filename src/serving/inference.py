@@ -25,199 +25,142 @@ Production Deployment:
 """
 
 import os
+import glob
+import json
 import pandas as pd
 import mlflow
 
-# === MODEL LOADING CONFIGURATION ===
-# IMPORTANT: This path is set during Docker container build
-# In development: uses local MLflow artifacts
-# In production: uses model copied to container at build time
-MODEL_DIR = "/app/model"
+# === PATH CONFIGURATION ===
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
-try:
-    # Load the trained XGBoost model in MLflow pyfunc format
-    # This ensures compatibility regardless of the underlying ML library
-    model = mlflow.pyfunc.load_model(MODEL_DIR)
-    print(f"✅ Model loaded successfully from {MODEL_DIR}")
-except Exception as e:
-    print(f"❌ Failed to load model from {MODEL_DIR}: {e}")
-    # Fallback for local development (OPTIONAL)
-    try:
-        # Try loading from local MLflow tracking
-        import glob
-        local_model_paths = glob.glob("./mlruns/*/*/artifacts/model")
-        if local_model_paths:
-            latest_model = max(local_model_paths, key=os.path.getmtime)
-            model = mlflow.pyfunc.load_model(latest_model)
-            MODEL_DIR = latest_model
-            print(f"✅ Fallback: Loaded model from {latest_model}")
-        else:
-            raise Exception("No model found in local mlruns")
-    except Exception as fallback_error:
-        raise Exception(f"Failed to load model: {e}. Fallback failed: {fallback_error}")
+# Docker: /app/model | Local: auto-discovered from mlruns
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
 
-# === FEATURE SCHEMA LOADING ===
-# CRITICAL: Load the exact feature column order used during training
-# This ensures the model receives features in the expected order
-try:
-    feature_file = os.path.join(MODEL_DIR, "feature_columns.txt")
-    with open(feature_file) as f:
-        FEATURE_COLS = [ln.strip() for ln in f if ln.strip()]
-    print(f"✅ Loaded {len(FEATURE_COLS)} feature columns from training")
-except Exception as e:
-    raise Exception(f"Failed to load feature columns: {e}")
+# Lazy-loaded globals (populated on first predict() call)
+model = None
+FEATURE_COLS = None
 
-# === FEATURE TRANSFORMATION CONSTANTS ===
-# CRITICAL: These mappings must exactly match those used in training
-# Any changes here will cause train/serve skew and degrade model performance
-
-# Deterministic binary feature mappings (consistent with training)
 BINARY_MAP = {
-    "gender": {"Female": 0, "Male": 1},           # Demographics
-    "Partner": {"No": 0, "Yes": 1},               # Has partner
-    "Dependents": {"No": 0, "Yes": 1},            # Has dependents  
-    "PhoneService": {"No": 0, "Yes": 1},          # Phone service
-    "PaperlessBilling": {"No": 0, "Yes": 1},      # Billing preference
+    "gender":          {"Female": 0, "Male": 1},
+    "Partner":         {"No": 0, "Yes": 1},
+    "Dependents":      {"No": 0, "Yes": 1},
+    "PhoneService":    {"No": 0, "Yes": 1},
+    "PaperlessBilling":{"No": 0, "Yes": 1},
 }
-
-# Numeric columns that need type coercion
 NUMERIC_COLS = ["tenure", "MonthlyCharges", "TotalCharges"]
 
+
+def _load_model():
+    global model, MODEL_DIR
+    if model is not None:
+        return
+
+    # === Docker path (/app/model) ===
+    if os.path.exists(MODEL_DIR) and os.path.exists(os.path.join(MODEL_DIR, "MLmodel")):
+        try:
+            model = mlflow.pyfunc.load_model(MODEL_DIR)
+            print(f"✅ Model loaded from {MODEL_DIR}")
+            return
+        except Exception as e:
+            print(f"❌ Docker model load failed: {e}")
+
+    # === Local development fallback (mlruns) ===
+    patterns = [
+        os.path.join(PROJECT_ROOT, "mlruns", "*", "*", "artifacts", "model"),
+        os.path.join(PROJECT_ROOT, "model_export", "model"),
+    ]
+    paths = []
+    for p in patterns:
+        paths.extend(glob.glob(p))
+
+    if not paths:
+        raise FileNotFoundError(
+            "No model found. Run:\n"
+            "  python scripts/run_pipeline.py --input src/data/rawdata/Churn.csv --target Churn\n"
+            "  python scripts/export_model.py"
+        )
+
+    latest = max(paths, key=os.path.getmtime)
+
+    # Windows requires file:/// prefix for local paths
+    model_uri = f"file:///{latest.replace(os.sep, '/')}"
+    mlruns_uri = f"file:///{os.path.join(PROJECT_ROOT, 'mlruns').replace(os.sep, '/')}"
+    mlflow.set_tracking_uri(mlruns_uri)
+
+    model = mlflow.pyfunc.load_model(model_uri)
+    MODEL_DIR = latest
+    print(f"✅ Model loaded from local mlruns: {latest}")
+
+
+def _load_features():
+    global FEATURE_COLS
+    if FEATURE_COLS is not None:
+        return
+
+    # Search order: model dir json → model dir txt → artifacts dir json
+    candidates = [
+        (os.path.join(MODEL_DIR, "feature_columns.json"), "json"),
+        (os.path.join(MODEL_DIR, "feature_columns.txt"),  "txt"),
+        (os.path.join(PROJECT_ROOT, "artifacts", "feature_columns.json"), "json"),
+    ]
+
+    for path, fmt in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                FEATURE_COLS = json.load(f) if fmt == "json" else [
+                    l.strip() for l in f if l.strip()
+                ]
+            print(f"✅ Loaded {len(FEATURE_COLS)} feature columns from {path}")
+            return
+
+    raise FileNotFoundError(
+        f"feature_columns not found in any of:\n"
+        + "\n".join(f"  {p}" for p, _ in candidates)
+        + "\nRe-run the pipeline and export_model.py"
+    )
+
+
 def _serve_transform(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply identical feature transformations as used during model training.
-    
-    This function is CRITICAL for production ML - it ensures that features are
-    transformed exactly as they were during training to prevent train/serve skew.
-    
-    Transformation Pipeline:
-    1. Clean column names and handle data types
-    2. Apply deterministic binary encoding (using BINARY_MAP)
-    3. One-hot encode remaining categorical features  
-    4. Convert boolean columns to integers
-    5. Align features with training schema and order
-    
-    Args:
-        df: Single-row DataFrame with raw customer data
-        
-    Returns:
-        DataFrame with features transformed and ordered for model input
-        
-    IMPORTANT: Any changes to this function must be reflected in training
-    feature engineering to maintain consistency.
-    """
     df = df.copy()
-    
-    # Clean column names (remove any whitespace)
     df.columns = df.columns.str.strip()
-    
-    # === STEP 1: Numeric Type Coercion ===
-    # Ensure numeric columns are properly typed (handle string inputs)
+
     for c in NUMERIC_COLS:
         if c in df.columns:
-            # Convert to numeric, replacing invalid values with NaN
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-            # Fill NaN with 0 (same as training preprocessing)
-            df[c] = df[c].fillna(0)
-    
-    # === STEP 2: Binary Feature Encoding ===
-    # Apply deterministic mappings for binary features
-    # CRITICAL: Must use exact same mappings as training
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
     for c, mapping in BINARY_MAP.items():
         if c in df.columns:
             df[c] = (
-                df[c]
-                .astype(str)                    # Convert to string
-                .str.strip()                    # Remove whitespace
-                .map(mapping)                   # Apply binary mapping
-                .astype("Int64")                # Handle NaN values
-                .fillna(0)                      # Fill unknown values with 0
-                .astype(int)                    # Final integer conversion
+                df[c].astype(str).str.strip()
+                .map(mapping).astype("Int64").fillna(0).astype(int)
             )
-    
-    # === STEP 3: One-Hot Encoding for Remaining Categorical Features ===
-    # Find remaining object/categorical columns (not in BINARY_MAP)
-    obj_cols = [c for c in df.select_dtypes(include=["object"]).columns]
+
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
     if obj_cols:
-        # Apply one-hot encoding with drop_first=True (same as training)
-        # This prevents multicollinearity by dropping the first category
         df = pd.get_dummies(df, columns=obj_cols, drop_first=True)
-    
-    # === STEP 4: Boolean to Integer Conversion ===
-    # Convert any boolean columns to integers (XGBoost compatibility)
+
     bool_cols = df.select_dtypes(include=["bool"]).columns
-    if len(bool_cols) > 0:
+    if len(bool_cols):
         df[bool_cols] = df[bool_cols].astype(int)
-    
-    # === STEP 5: Feature Alignment with Training Schema ===
-    # CRITICAL: Ensure features are in exact same order as training
-    # Missing features get filled with 0, extra features are dropped
+
     df = df.reindex(columns=FEATURE_COLS, fill_value=0)
-    
     return df
 
+
 def predict(input_dict: dict) -> str:
-    """
-    Main prediction function for customer churn inference.
-    
-    This function provides the complete inference pipeline from raw customer data
-    to business-friendly prediction output. It's called by both the FastAPI endpoint
-    and the Gradio interface to ensure consistent predictions.
-    
-    Pipeline:
-    1. Convert input dictionary to DataFrame
-    2. Apply feature transformations (identical to training)
-    3. Generate model prediction using loaded XGBoost model
-    4. Convert prediction to user-friendly string
-    
-    Args:
-        input_dict: Dictionary containing raw customer data with keys matching
-                   the CustomerData schema (18 features total)
-                   
-    Returns:
-        Human-readable prediction string:
-        - "Likely to churn" for high-risk customers (model prediction = 1)
-        - "Not likely to churn" for low-risk customers (model prediction = 0)
-        
-    Example:
-        >>> customer_data = {
-        ...     "gender": "Female", "tenure": 1, "Contract": "Month-to-month",
-        ...     "MonthlyCharges": 85.0, ... # other features
-        ... }
-        >>> predict(customer_data)
-        "Likely to churn"
-    """
-    
-    # === STEP 1: Convert Input to DataFrame ===
-    # Create single-row DataFrame for pandas transformations
+    # Lazy load on first call — safe for both Docker and local
+    _load_model()
+    _load_features()
+
     df = pd.DataFrame([input_dict])
-    
-    # === STEP 2: Apply Feature Transformations ===
-    # Use the same transformation pipeline as training
     df_enc = _serve_transform(df)
-    
-    # === STEP 3: Generate Model Prediction ===
-    # Call the loaded MLflow model for inference
-    # The model returns predictions in various formats depending on the ML library
+
     try:
         preds = model.predict(df_enc)
-        
-        # Normalize prediction output to consistent format
         if hasattr(preds, "tolist"):
-            preds = preds.tolist()  # Convert numpy array to list
-            
-        # Extract single prediction value (for single-row input)
-        if isinstance(preds, (list, tuple)) and len(preds) == 1:
-            result = preds[0]
-        else:
-            result = preds
-            
+            preds = preds.tolist()
+        result = preds[0] if isinstance(preds, (list, tuple)) else preds
     except Exception as e:
         raise Exception(f"Model prediction failed: {e}")
-    
-    # === STEP 4: Convert to Business-Friendly Output ===
-    # Convert binary prediction (0/1) to actionable business language
-    if result == 1:
-        return "Likely to churn"      # High risk - needs intervention
-    else:
-        return "Not likely to churn"  # Low risk - maintain normal service
+
+    return "Likely to churn" if result == 1 else "Not likely to churn"

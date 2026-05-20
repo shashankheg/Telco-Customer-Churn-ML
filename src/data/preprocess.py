@@ -25,6 +25,7 @@ def preprocess_data(df: pd.DataFrame, target_col: str = "Churn") -> pd.DataFrame
     # TotalCharges often has blanks in this dataset -> coerce to float
     if "TotalCharges" in df.columns:
         df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+        df['TotalCharges'] = df['TotalCharges'].fillna(0)
 
     # SeniorCitizen should be 0/1 ints if present
     if "SeniorCitizen" in df.columns:

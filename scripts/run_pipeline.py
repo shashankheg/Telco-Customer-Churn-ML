@@ -10,7 +10,7 @@ import argparse
 import pandas as pd
 import mlflow
 import mlflow.sklearn
-from posthog import project_root
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, precision_score, recall_score,
@@ -37,7 +37,7 @@ def main(args):
     # === MLflow Setup - ESSENTIAL for experiment tracking ===
     # Configure MLflow to use local file-based tracking (not a tracking server)
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    mlruns_path = args.mlflow_uri or f"file://{project_root}/mlruns"  # Local file-based tracking
+    mlruns_path = args.mlflow_uri or f"file:///{project_root}/mlruns"  # Local file-based tracking
     mlflow.set_tracking_uri(mlruns_path)
     mlflow.set_experiment(args.experiment)  # Creates experiment if doesn't exist
 
@@ -106,7 +106,9 @@ def main(args):
             json.dump(feature_cols, f)
 
         # Log to MLflow for production serving
-        mlflow.log_text("\n".join(feature_cols), artifact_file="feature_columns.txt")
+        with open("feature_columns.txt", "w") as f:
+            f.write("\n".join(feature_cols))
+        mlflow.log_artifact("feature_columns.txt", artifact_path="model")
 
         # ESSENTIAL: Save preprocessing artifacts for serving pipeline
         # These artifacts ensure training and serving use identical transformations

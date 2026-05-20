@@ -7,8 +7,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.data.preprocess import preprocess_data
 from src.features.build_features import build_features
 
-RAW = "data/raw/Telco-Customer-Churn.csv"
-OUT = "data/processed/telco_churn_processed.csv"
+RAW = "data/rawdata/Churn.csv"
+OUT = "data/processed/churn_processed.csv"
 
 # 1) load raw
 df = pd.read_csv(RAW)
